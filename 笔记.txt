@@ -665,3 +665,57 @@
 
 明天从这里接：
    logits = h @ W2 + b2  →  dW2、db2、dh 分别是什么形状、为什么
+
+──── 2026-11-10 ────
+
+今天推完了矩阵乘的反向，另外搞清了贝塞尔校正。看视频到第五节 1:20。
+
+1. dh = dlogits @ W2.T 是怎么来的：只看一个格子。
+   前向 logits[i][j] = Σ_k h[i][k] * W2[k][j]
+   所以 ∂logits[i][j]/∂h[i][k] = W2[k][j]
+   而 h[i][k] 这一个数影响了全部 27 个输出，要收 27 份梯度：
+   dh[i][k] = Σ_j dlogits[i][j] * W2[k][j]
+            = dlogits 第 i 行 和 W2 第 k 行的内积
+            = (dlogits @ W2.T)[i][k]
+   实测：三层 for 循环手算 和 dlogits @ W2.T 完全一致。
+
+2. 矩阵乘反向三件套（前向 C = A @ B）：
+   dA = dC @ B.T      dB = A.T @ dC      db = dC.sum(0)
+   记法：算谁的梯度，就把另一个操作数转置后挪到对面，dC 留在自己这一侧。
+   记住不就有形状兜底——算出来必须和 A、B 同形。
+   不转置的话报错很直白：mat1 and mat2 shapes cannot be multiplied (3x5 and 4x5)。
+
+3. 这和"一个数被用几次就收几份"是同一条规则。matmul 只是批量版的复用求和。
+   db2 = dlogits.sum(0) 又是一次广播反向求和（消掉的是样本维，所以 sum(0)，
+   和 dcounts_sum_inv 那次 sum(1) 方向相反）。
+
+4. 贝塞尔校正：bnvar = 1/(n-1) * (bndiff2).sum(0, keepdim=True)。
+   有偏 ÷n / 无偏 ÷(n-1)，差一个 n/(n-1)。
+   实测从 N(0,1) 抽 20 万批（真方差 1.0）：
+     n=2 时 ÷n 只有 0.4988，÷(n-1) 是 0.9976；
+     n=32 时 ÷n 是 0.96875，÷(n-1) 是 1.00000。
+   偏小不是随机误差，是系统性偏小。
+   原因：减的是 x̄ 不是真值 μ，x̄ 是离这批数据最近的点，
+   所以 Σ(x-x̄)² 必然比 Σ(x-μ)² 小。而 Σ(x-x̄) 恒等于 0，
+   n 个偏差被锁死一个，自由度只有 n-1，所以除以 n-1。
+   实际影响：n=32 时 std 只差 1.6%，n=2 时差 41%。
+
+5. ★ 今天最大的发现：PyTorch 的 BatchNorm 两处用不同的除法。
+   归一化这批数据 → 有偏 ÷n
+   更新 running_var → 无偏 ÷(n-1)
+   实测：bn.running_var == x.var(0, unbiased=True)  True
+         归一化输出 == 用 unbiased=False 算的        True
+   原因：归一化只管当下这一批，不多不少不必估计；
+        running_var 要留给未来所有 batch 用，那是在估计总体方差，必须无偏。
+   所以 Karpathy 手写 BN 时用 n-1，是为了和 running_var 对齐。
+   （这条也顺带推进了 11-08 待补的 B 项：BN 统计量的语义。）
+
+6. 坑：torch.var 默认 unbiased=True（÷n-1），numpy.var 默认 ÷n。两边默认相反。
+   要显式写 unbiased=False 才是有偏的那个。
+
+7. 术语撞车：bias 在统计学里是"有偏估计"（期望值≠真值），
+   在神经网络里是"偏置参数" b1/b2。Karpathy 在 BN 这段念的 bias/unbiased
+   全是统计学那个意思，和 b1、b2 无关。
+
+明天从这里接：
+   h = torch.tanh(hpreact)  →  tanh 的导数是什么（可以用 tanh 自己表示）
