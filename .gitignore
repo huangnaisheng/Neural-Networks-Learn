@@ -1,0 +1,11 @@
+# Jupyter 自动生成的检查点，每次保存都会变，不该进版本库
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 临时脚本
+tmp/
+*.tmp
