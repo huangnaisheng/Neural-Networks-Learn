@@ -841,3 +841,72 @@ GPT 是第七节。今天把整张网络从"一次压平"改成了"分层合并"
    我在第 4 节写的每一个 sum(0)/mean(0) 都属于这一类。
 
 下一步：第七节（GPT）。
+
+──── 2026-11-13 ────
+
+第七节开了个头：bigram 跑起来了，CUDA 接通了，训练循环也写完了（7/bigram.py）。
+今天真正搞懂的只有一件事 —— optimizer 到底是什么。
+
+1. optimizer = torch.optim.AdamW(m.parameters(), lr=1e-03) 拆两半读：
+   m.parameters() 交出所有 requires_grad=True 的张量（是个 generator，只能遍历一次）；
+   lr 是每一步走多远，就是前几节手写的 learning_rate。
+   ★ 而 optimizer.step() 和我手写的 p.data -= lr * p.grad 是同一件事：
+   同样的初始权重、同样的 batch、同样的 lr=0.1，两边权重差 0.0（逐位相同）。
+   它不是新魔法，只是把手写的那几行收进去了，方便换成更聪明的更新公式。
+
+2. 三步循环：zero_grad -> backward -> step。
+   zero_grad 不能省，因为 backward 是"累加"进 p.grad 而不是覆盖。
+   实测同一个 batch 连跑三次不清零，那个权重的梯度是
+   -0.121874 -> -0.243747 -> -0.365621，正好一倍、两倍、三倍。
+
+3. AdamW 比 SGD 多的东西，就躺在 optimizer.state[参数] 里：两个数。
+   exp_avg（动量，防左右乱晃）和 exp_avg_sq（梯度平方的平均，用来给每个参数单独定步长）。
+   所以 lr=1e-3 这种默认值就能跑，不用像 SGD 那样为每一层试。
+   顺序上要先 m.to(device) 再建 optimizer —— optimizer 抓的是张量对象本身。
+
+4. ★ 训练循环本身一个字都不用为 CUDA 改。设备跟着张量走：
+   数据在 GPU、模型在 GPU，算出来的 logits / loss / 梯度就都在 GPU，optimizer 抓的也是它们。
+   整个 notebook / 脚本只有三处需要写 device：模型 .to(device)、get_batch 里的 .to(device)、
+   generate 里的 torch.zeros(..., device=device)（torch.zeros 不管在哪都默认造 CPU 张量）。
+   我另写了个小 bigram 对照：同一份代码 cpu / cuda 各跑 100 步，
+   loss 都是 4.740701198577881，权重差 2.4e-07 —— float32 的极限，GPU 求和顺序不同，不是 bug。
+
+5. ★ 但这么小的规模，GPU 反而慢：cpu 249ms / cuda 402ms（100 步，block_size=8, batch 32）。
+   一共才 256 个 token，kernel 启动的固定开销盖过了计算。
+   之前量的对照：batch 64 / block 256 / 6 层 384 时才是 327ms vs 13ms（25 倍）。
+   顺带：loss.item() 会强制同步，循环里别每一步都打。
+
+6. ★ loss 阶梯（自己算的理论值 + 自己跑出来的实测值）：
+     随机初始化 logits ~ N(0,1)          4.70     step 0     train 4.73  val 4.72
+     只学字母频率、完全不看上下文        3.31     step 300   train 2.81  val 2.82
+     看前一个字符（bigram 的理论下限）   2.45     step 900   train 2.49  val 2.51
+     真正的语言模型                      ~1.50    step 2700  train 2.47  val 2.49
+   900 步就到 2.49，后面 2000 步只赚了 0.03 —— bigram 确实到顶了，继续训是浪费。
+
+7. ★★ 单批 loss 不能用来判断模型好坏，今天被自己骗了一次。
+   我先读到 2.39，还以为是超常发挥；其实那是一个 batch（32×8=256 个 token）的瞬时读数。
+   按 bigram 的精确概率算 2000 个 batch：均值 2.4502，标准差 0.0707，范围 2.229 ~ 2.732。
+   同一个模型、同一份训练集，单批读数能从 2.23 跳到 2.73。2.39 只是均值 -0.9σ，纯噪声。
+   接上 estimate_loss（200 批平均）之后，真实值才露出来：train 2.4738 / val 2.4911。
+   教训：单批数字什么也说明不了，要么多批平均，要么用固定验证集。
+
+8. bigram 为什么到 2.45 就停死：nn.Embedding(65, 65) 等价于一张
+   "上一个字符 -> 下一个字符"的转移概率表，4225 个数，能用的信息只有一个字符。
+   它实际学到了：q->u 0.898、句号->换行 0.834、空格->t 0.141、h->e 0.353。
+   所以采样出来像英文（字母频率、th/ing/er 这些组合都对），
+   但 Wawice、Heriliovets、ndill 都不是词，HAPet / HDERarom 里大写也乱入 ——
+   因为生成每个字符时它只知道紧挨着的那一个。这条路到头了。
+
+9. ★ 一个之前没注意的坑：现在的 block_size=8 对 bigram 完全没用。
+   (B,8,65) 拉平成 (256,65) 去算 loss，8 个位置是 8 个独立样本，不是 8 个字符的上下文。
+   所以把 block_size 调大，bigram 的 loss 一点都不会降。
+   这正是下一节的转折点：怎么让模型真的"看到前面好几个字符"。
+   路线：先把前几个 embedding 求和/平均（~2.2）-> 再把"平均"换成可训练的权重
+   （点积 + softmax = self-attention）-> 最后堆到 6 层 384 维（~1.48）。
+
+10. 一个低级但值得记的 bug：estimate_loss 里写的是 model，外面模型叫 m，
+    报 NameError: name 'model' is not defined。
+    从 Karpathy 的 .py 抄下来改了名，但只改了一部分。
+    和上一条是同一类问题：改了一处，要回头搜一遍旧名字 / 复查所有受影响的维度。
+
+下一步：token embedding + 平均池化，然后把"平均"换成 attention。
