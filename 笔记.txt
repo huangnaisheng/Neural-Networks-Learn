@@ -910,3 +910,65 @@ GPT 是第七节。今天把整张网络从"一次压平"改成了"分层合并"
     和上一条是同一类问题：改了一处，要回头搜一遍旧名字 / 复查所有受影响的维度。
 
 下一步：token embedding + 平均池化，然后把"平均"换成 attention。
+
+──── 2026-11-14 ────
+
+第七节看到 1:22（约 1 小时 20 分）。今天把模型从 bigram 改成了"三层结构 + 单头自注意力"，
+loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来。
+
+1. torch.allclose 的坑（花了最久才想通）。它判的是 |a-b| <= atol + rtol*|b|，默认 atol=1e-8, rtol=1e-5。
+   我的 64 个元素里只有 1 个超：diff 3.24e-08，允许 3.02e-08，差 0.2e-8。
+   根因：float32 的 eps 是 1.19e-07，根本给不了 1e-8 的绝对精度。
+   而且规律很清楚：权重是 1/1、1/2、1/4 的行误差正好 0，1/3、1/5、1/7 一定带舍入；
+   再叠加 mean（先加后除）和 BLAS matmul（FMA、累加顺序不同）两条路。
+   结论：以后统一用 torch.allclose(a, b, atol=1e-6)，或者直接看 (a-b).abs().max()。
+
+2. 三层结构改造：把 nn.Embedding(65, 65) 拆成
+   token_embedding(65,32) + position_embedding(8,32) + lm_head(Linear 32->65)。
+   参数 4225 -> 4481。重点不是参数，是"字符的身份"和"预测结果"分开了：
+   原来那张表兼着干两件事，输出直接就是 logits，中间没有可以修改的东西。
+   现在有了 x (B,T,32) 这条"残差流"——后面 attention 和 MLP 都从它读、往它写。
+
+3. ★ 但这一版还是 bigram。我用 lr=1e-2 训了 4000 步：train 2.4873 / val 2.5164，
+   和纯 bigram 的 2.47 / 2.49 一样。
+   扰动实验更直接：把 idx[0,0] 改掉一个字符，logits 的变化是
+     位置 0: 1.87    位置 1~7: 0
+   其余 31 个位置 bit 完全相同 —— forward 里没有任何一步让不同的 t 交互。
+   这就是为什么要接着写注意力：不是网络不够大，是信息根本没流过。
+
+4. 两个形状细节：
+   pos_emb 是 (T,32)，没有 batch 维，靠广播加到 (B,T,32) —— 位置对 4 条序列是同一件事。
+   torch.arange(T, device=device) 的 device 不能忘（和 torch.zeros 一样默认 CPU）；
+   T > block_size 会 IndexError，因为位置表只有 block_size 行。
+
+5. nn.Linear(n_embd, head_size, bias=False) 就是加权求和：W 的每一行是一套权重，算出一个输出数。
+   它和昨天的 wei @ x 是同一个操作，只是换了轴：
+     wei 在"时间"维上加权（8 个位置 -> 8 个位置）
+     W   在"特征"维上加权（32 个特征 -> 16 个特征）
+   权重存成 (out, in) 即 (16,32)，不是 (32,16)；只改最后一维，前面维度原样保留，
+   所以能直接吃 (B,T,C)。第 4 节自己写的 Linear 是 (in,out) + x@W，数学一样，只是存反了。
+
+6. Head 类：key / query / value 是三个结构相同、参数不同的 Linear，都做 (B,T,32) -> (B,T,16)。
+   q @ k.T -> (B,T,T) 打分表；tril 遮住未来；softmax 归一；wei @ v 混合。
+   register_buffer('tril', ...) 用 buffer 而不是普通属性，是为了跟着 .to(device) 走，
+   又不会被算进 parameters()。
+
+7. ★ bug：generate 里 idx_cond 裁好了却没用，写的是 self(idx)。
+   训练全程正常，只在生成第 9 个字符时炸（idx 长度超过 block_size，位置表越界）。
+   报错是 CUDA 的 Assertion `srcIndex < srcSelectDimSize` failed，不是 Python 的 IndexError
+   —— GPU 上的越界检查走 C++ 断言。同样代码在 CPU 上跑会直接说
+   IndexError: index out of range in self。教训：训练能跑完 ≠ 代码没问题。
+
+8. ★ 隐患：C**-0.5 应该是 head_size**-0.5。
+   现在 Head(n_embd) 让 head_size == n_embd == 32，两者数值一样，所以没暴露。
+   等做 multi-head，head_size = 32//4 = 8 而 C 还是 32，就差了 2 倍 —— 不报错，只是效果偏。
+   这类"现在恰好对"的 bug 最难查。
+
+9. ★ 收益：bigram 2.47/2.49 -> 单头注意力 2.38/2.40，val 掉了 0.09。
+   生成 500 字还是乱码，但出现了 peal 这种像词的片段。
+   单头 + block_size=8 只能做到这里；真要看效果得等 multi-head 和更长的上下文。
+
+10. 小操作：JupyterLab 里选中单元格按 Esc 再按 M 变 markdown（Y 变回代码，Shift+Enter 渲染）。
+    之前那个 "## The mathematical trick" 一直不显示成标题，就是因为它是 code cell，## 只是注释。
+
+下一步：multi-head（多个 Head 并行，每个 head_size = n_embd // n_head，再拼起来）。
