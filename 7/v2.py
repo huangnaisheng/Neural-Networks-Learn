@@ -5,15 +5,17 @@ from torch.nn import functional as F
 # hyperparameters
 batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
+
+n_embd = 384 # the number of embedding dimensions
+n_layers = 6 # the number of transformer blocks
+n_head = 6 # the number of attention heads
+dropout = 0.2 # the dropout probability
+
 max_iters = 5000 # how many training iterations to run?
 eval_interval = 500 # how often to evaluate the loss?
 learning_rate = 3e-4 # learning rate for the optimizer
 device = 'cuda' if torch.cuda.is_available() else 'cpu' # I use cuda instead of cpu
 eval_iters = 200 # how many batches to evaluate the loss on?
-n_embd = 384 # the number of embedding dimensions
-n_layers = 6 # the number of transformer blocks
-n_head = 6 # the number of attention heads
-dropout = 0.2 # the dropout probability
 # --------------
 
 torch.manual_seed(1337)
