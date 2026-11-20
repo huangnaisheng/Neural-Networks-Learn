@@ -1106,3 +1106,17 @@ loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来�
    - 真正有效的是 Context Engineering（上下文工程）：给足真实代码/报错/资料（给 Attention 喂干货 V）、明确边界约束、给出 Few-shot 示例。
 
 下一步：进军下一节硬核代码实战（Tokenizer BPE 分词器）。
+
+
+──── 2026-11-20 ────
+（第九节 Tokenizer / MiniBPE 看到 40 分钟，BPE 核心合并循环跑通）
+
+1. 大模型很多怪病的根源不在 Transformer，在 Tokenizer（切词方式）：
+   - 不会拼写单词、反转字符串容易错、非英语更贵更慢、算术不稳定，大多是因为一个词被整块压成了一个 Token ID，模型内部根本"看不到"里面的单个字母。
+
+2. ★ BPE（Byte Pair Encoding）核心三件套（从 256 个 UTF-8 基础字节滚雪球）：
+   - `get_stats(ids)`：用 `zip(ids, ids[1:])` 拉链对齐相邻元素，统计所有相邻对的出现频次。
+   - `merge(ids, pair, idx)`：扫描列表，遇到目标 `pair` 就塞入新编号 `idx` 并跳两步（`i += 2`）；注意 `i < len(ids) - 1` 防越界。
+   - 主循环：每轮挑最高频 `max(stats, key=stats.get)`，发新号 `256 + i` 替换原序列，并把规则记入 `merges` 账本。刚捏出的 `256` 在下一轮还能继续和旁边的字节捏成 `257`（如 `t`+`h` -> `256`，下轮 `256`+`e` -> `257` 即 `"the"`）。
+
+3. 踩坑：`print(sorted((v,k) for k,v in stats.items()), reverse=True)` 报 `TypeError: 'reverse' is an invalid keyword argument for print()` —— `reverse=True` 写到 `sorted()` 右括号外面了，传给了 `print`。
