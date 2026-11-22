@@ -1120,3 +1120,19 @@ loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来�
    - 主循环：每轮挑最高频 `max(stats, key=stats.get)`，发新号 `256 + i` 替换原序列，并把规则记入 `merges` 账本。刚捏出的 `256` 在下一轮还能继续和旁边的字节捏成 `257`（如 `t`+`h` -> `256`，下轮 `256`+`e` -> `257` 即 `"the"`）。
 
 3. 踩坑：`print(sorted((v,k) for k,v in stats.items()), reverse=True)` 报 `TypeError: 'reverse' is an invalid keyword argument for print()` —— `reverse=True` 写到 `sorted()` 右括号外面了，传给了 `print`。
+
+──── 2026-11-21 ────
+（第九节 Tokenizer / MiniBPE 看到 1 小时 20 分钟）
+
+1. `encode` / `decode` 是两个相反方向：
+   - `encode`：字符串 -> UTF-8 字节 -> 0~255 的基础 token -> 按 `merges` 记录的优先级反复合并 -> token 编号列表。
+   - `decode`：token 编号 -> 查 `vocab` 还原每个 token 对应的字节 -> 拼成完整字节串 -> UTF-8 解码回字符串。
+
+2. 两本“账”的分工：
+   - `merges` 记录编码时哪些相邻 pair 可以合并、合并成哪个新编号；新编号越小，表示训练时越早学到，编码时优先级越高。
+   - `vocab` 记录每个编号对应哪些字节：0~255 各代表一个原始字节，256 以后由已有 token 的字节拼接而成。
+   - 训练时挑出现次数最多的 pair 来新增合并规则；编码时不再按频率挑，而是遵循训练好的 `merges` 优先级。
+
+3. `decode([128])` 显示 `�` 不是 BPE 出错：单独的字节 128 不是完整合法的 UTF-8 字符；`errors="replace"` 会用替代字符显示无法解码的字节。
+
+4. 检查编码和解码能否还原原文：`decode(encode(text)) == text`。
