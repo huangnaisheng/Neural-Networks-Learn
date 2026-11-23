@@ -1136,3 +1136,16 @@ loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来�
 3. `decode([128])` 显示 `�` 不是 BPE 出错：单独的字节 128 不是完整合法的 UTF-8 字符；`errors="replace"` 会用替代字符显示无法解码的字节。
 
 4. 检查编码和解码能否还原原文：`decode(encode(text)) == text`。
+
+5. tiktoken 与 SentencePiece 的区别：
+   - `tiktoken`：先把文字编码成 UTF-8 字节，再对字节做 BPE；基础词表只需覆盖 0~255，所有语言统一走字节路线。
+   - `SentencePiece`：直接对 Unicode code point（可先理解为字符本身）做 BPE。训练时用 `character_coverage` 控制保留哪些常见字符；罕见字符可以映射为 `<unk>`，也可以打开 `byte_fallback` 退回 UTF-8 字节表示。
+   - SentencePiece 既能训练 tokenizer，也能用训练好的 tokenizer 做推理；tiktoken 更常作为高性能的现成 tokenizer 使用。
+
+6. `<|endoftext|>`：作为普通文本输入时只是字符串，不会让对话自动停止；作为模型生成流程中的特殊 token 时，某些模型会把它当作文本结束信号，从而停止生成。
+
+7. tokenizer 造成的两个典型现象：
+   - `trailing whitespace`（行尾空白）：空格会参与 tokenization，`"hello"`、`"hello "` 和 `"hello  "` 可能对应不同 token 序列；人眼觉得末尾空格没有意义，模型看到的输入却变了。
+   - `SolidGoldMagikarp`：著名的 glitch token 案例。某些 GPT-2 词表可能把它或相关字符串切成非常罕见的 token；token 虽然在词表中，但训练次数不足，embedding 可能没有学好，导致模型输出异常。不同模型和 tokenizer 的表现不一定相同。
+
+8. 今天的共同主线：LLM 不直接读取人眼看到的文字，而是读取 tokenizer 产生的 token 序列；tokenizer 的切分方式会影响模型实际能看到的信息。第九节 Tokenizer 到此结束。
