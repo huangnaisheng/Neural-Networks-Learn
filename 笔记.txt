@@ -1149,3 +1149,25 @@ loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来�
    - `SolidGoldMagikarp`：著名的 glitch token 案例。某些 GPT-2 词表可能把它或相关字符串切成非常罕见的 token；token 虽然在词表中，但训练次数不足，embedding 可能没有学好，导致模型输出异常。不同模型和 tokenizer 的表现不一定相同。
 
 8. 今天的共同主线：LLM 不直接读取人眼看到的文字，而是读取 tokenizer 产生的 token 序列；tokenizer 的切分方式会影响模型实际能看到的信息。第九节 Tokenizer 到此结束。
+
+
+──── 2026-11-24 ────
+（第十节 Reproduce GPT-2 124M 看到 40 分钟：搭完工业版 GPT-2 骨架，载入 Hugging Face 官方权重跑通推理）
+
+1. `Block` 与 `GPT.forward` 的逻辑骨架和第 7 节（`7/v2.py`）完全一致，主要变化在于“改名对齐官方”和“打包更严谨”：
+   - 改名：`ln1`/`sa`/`ffwd` 改成 `ln_1`/`attn`/`mlp`，嵌入与头改成 `wte`/`wpe`/`h`/`ln_f`——PyTorch 加载权重按名字严格对号入座，必须对齐官方命名才能灌入权重。
+   - 打包与细节：用 `@dataclass GPTConfig` 统一打包超参数传给各层；`forward` 门口加了 `assert T <= block_size` 提早拦截超长序列，`pos` 用 `device=idx.device` 自动跟随输入设备，loss 用 `.view(-1, ...)` 自动推算 `B*T`。
+
+2. `MLP` 改用 `GELU(approximate='tanh')`：
+   - 把 `ReLU` 在 0 点一刀切的硬折角换成平滑弯道，缓解负半轴梯度直接归零（神经元死亡）的问题，同时对齐 GPT-2 官方原版配置。
+
+3. `CausalSelfAttention` 是第 7 节 `MultiHeadAttention` + `Head` 的并行加速版：
+   - `c_attn` 把 Q/K/V 三个线性层和 12 个头合在一张 `3 * n_embd` 大矩阵里一次算完，再 `split` 拆分；`.view` + `.transpose(1, 2)` 变成 `(B, nh, T, hs)`，把 12 个头并进批次维让 GPU 一次并行算完（干掉 `for` 循环）。
+   - 用 `F.scaled_dot_product_attention(q, k, v, is_causal=True)`（FlashAttention）替代手写的 `q @ k.T`、下三角遮罩和 `softmax`；算完 `.transpose(1, 2).contiguous().view(B, T, C)` 拼回 `n_embd`（`transpose` 后内存不连续，需 `.contiguous()` 理顺才能 `.view`）。
+   - `c_proj(y)` 是汇总融合层：把 12 个头并排装订出来的报告重新打散融合一遍，投射回主干道准备做残差相加。
+
+4. 官方权重加载与推理闭环（`10/train_gpt2.py`）：
+   - `GPT.from_pretrained('gpt2')` 拉取 Hugging Face 权重，并把 OpenAI 当年用 `Conv1D` 存反了的四个权重矩阵（`c_attn`/`c_proj`/`c_fc`/`c_proj`）转置（`.t()`）对齐拷入。
+   - 接上 `tiktoken` 把 `"Hello, I'm a language model,"` 编成 8 个 token，复制 `batch=5` 送到 CUDA 上做 Top-50 采样续写到 30 个 token，验证手写模型的前向传播与官方 GPT-2 数学等价。
+
+5. VS Code 小坑排查：`torch.nn` 不高亮且有波浪线，不是主题或语义高亮开关问题，而是 VS Code 选到了没装 `torch` 的 Python 解释器（Pylance 解析失败导致语义着色退化）；切回装有 `torch` 的 Python 3.12 即可恢复。
