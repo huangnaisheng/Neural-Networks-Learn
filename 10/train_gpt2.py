@@ -1,7 +1,11 @@
 from dataclasses import dataclass
+import sys
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# Windows console defaults to GBK, printing garbage chars from a random model raises UnicodeEncodeError
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 # ------------------------------------------------------------------------------------------
 
@@ -180,13 +184,80 @@ class GPT(nn.Module):
 
         return model
 
+device = "cuda"
 # ---------------------------------------------------------------------
-num_return_sequences = 5
-max_length = 30
+import tiktoken
+import numpy as np
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
-model.to('cuda')
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
+class DataLoaderLite:
+    def __init__(self, B, T, process_rank, num_processes, split):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
+        return x, y
+
+# -----------------------------------------------------------------------------
+
+train_loader = DataLoaderLite(B=4, T=32, split = 'train', process_rank=0, num_processes=1)
+
+# get logits
+model = GPT(GPTConfig())
+model.to(device)
+
+#optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device) , y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}: loss {loss.item()}")
+
+
+
+import sys;sys.exit(0)
+
 
 # prefix tokens
 import tiktoken
@@ -194,7 +265,7 @@ enc = tiktoken.get_encoding('gpt2')
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to('cuda')
+x = tokens.to(device)
 
 # generate! right now x is (B ,T) where B = 5, T = 8
 # set the seed to 42

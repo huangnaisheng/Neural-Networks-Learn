@@ -1171,3 +1171,29 @@ loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来�
    - 接上 `tiktoken` 把 `"Hello, I'm a language model,"` 编成 8 个 token，复制 `batch=5` 送到 CUDA 上做 Top-50 采样续写到 30 个 token，验证手写模型的前向传播与官方 GPT-2 数学等价。
 
 5. VS Code 小坑排查：`torch.nn` 不高亮且有波浪线，不是主题或语义高亮开关问题，而是 VS Code 选到了没装 `torch` 的 Python 解释器（Pylance 解析失败导致语义着色退化）；切回装有 `torch` 的 Python 3.12 即可恢复。
+
+
+──── 2026-11-25 ────
+（第十节 Reproduce GPT-2 看到 1 小时 20 分钟：数据批次形状验证 + 权重共享）
+
+1. 今天一口气踩了四个坑，全在 `10/train_gpt2.py`：
+   - `GPT(GPTConfig(()))` 里的空元组被当成了第一个位置参数，`block_size` 变成 `()`，`nn.Embedding` 报 `TypeError: empty(): argument 'size' ... found element of type tuple`。正确写法是 `GPTConfig()`（无参 = 全用默认值）。
+   - `torch.tensor(tokens[...])` 不给 `device` 就默认建在 CPU，而模型在 cuda，查嵌入表时炸 `RuntimeError: Expected all tensors to be on the same device, but got index is on cpu, different from other tensors on cuda:0`。凡是喂给模型的张量都要 `.to(device)` 或建张量时指定 `device=device`。
+   - `GPT.forward` 返回的是 `(logits, loss)` 元组，写 `logits = model(x)` 再取 `.shape` 会报 `AttributeError: 'tuple' object has no attribute 'shape'`；要么 `logits, loss = model(x)` 拆包，要么 `model(x)[0]`。
+   - Windows 控制台默认 GBK，随机模型解码出的字符打印时报 `UnicodeEncodeError`；开头加 `sys.stdout.reconfigure(encoding='utf-8', errors='replace')` 解决。
+
+2. 数据批次验证（Karpathy 在这一步要看的就是形状）：
+   - `B, T = 4, 6`；`buf = tokens[:B*T + 1]`（长度 25），`x = buf[:-1].view(B, T)`，`y = buf[1:].view(B, T)`——`y` 就是 `x` 往后错一位，正好是"预测下一个 token"的标签。
+   - `logits` 形状 `(4, 6, 50257)`，即 `(B, T, vocab_size)`。之前手写 `B,T = 4,32` 却 `.view(4, 6)` 是自相矛盾的，统一成变量才不容易错。
+
+3. weight sharing（权重绑定）在干什么：
+   - `wte` 是 `Embedding(50257, 768)`，干的活是"编号 -> 向量"；`lm_head` 是 `Linear(768, 50257, bias=False)`，`Linear` 存 `(out, in)`，所以权重同样是 `(50257, 768)`，干的活是"向量 -> 给每个编号打分"。两者形状天然一致。
+   - `self.transformer.wte.weight = self.lm_head.weight` 不是复制数值，而是让两个名字指向**同一块内存**。助手实测：赋值后 `wte.weight is lm_head.weight` 为 `True`，`data_ptr()` 相同，`lm_head(x)` 与 `x @ wte.weight.T` 完全相等，且 `logits[i] == dot(x, wte.weight[i])`。
+   - 收益：省掉 50257 × 768 = 38,597,376 个参数（GPT-2 124M 从 163M 降回 124M）；罕见 token 能同时收到"输入侧"和"输出侧"两份梯度，embedding 学得更好。
+   - 通俗版：一本双向词典，正面"词 -> 意思"，反面"意思 -> 词"，内容一样就只印一本；合并后"预测下一个词"变成"看当前向量的方向最像哪个词的向量"。
+
+4. Jupyter 的 CWD 坑：VS Code 跑 notebook 时内核工作目录是**工作区根目录**，不是 notebook 所在文件夹，所以 `open('input.txt')` 找不到 `10/` 里的文件；用绝对路径或先 `os.chdir()`。
+
+5. 平台坑：`!wget` 在 Windows 上不存在（`'wget' is not recognized`），notebook 里报错会被吞掉、继续往下跑，于是下一步才报 `FileNotFoundError`，容易误判成"文件没放"。
+
+下一步：接着往下做真正的训练循环（把 `y` 传给 `model(x, y)` 算 loss、建 optimizer、跑 step）。
