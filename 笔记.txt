@@ -1197,3 +1197,15 @@ loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来�
 5. 平台坑：`!wget` 在 Windows 上不存在（`'wget' is not recognized`），notebook 里报错会被吞掉、继续往下跑，于是下一步才报 `FileNotFoundError`，容易误判成"文件没放"。
 
 下一步：接着往下做真正的训练循环（把 `y` 传给 `model(x, y)` 算 loss、建 optimizer、跑 step）。
+
+
+──── 2026-11-26 ────
+（第十节 Reproduce GPT-2 看到 2 小时：训练效率极限压榨）
+
+1. TF32 / BF16 混合精度为什么能提速（解决"算力"和"显存搬运堵车"两个瓶颈）：
+   - TF32（`torch.set_float32_matmul_precision('high')`）：显存里仍存 32 位，但送进 Tensor Core 做矩阵乘的瞬间把小数尾数砍掉一半，一行代码白嫖算力。
+   - BF16（`torch.autocast`）：16 位格式，但保留了和 FP32 一样宽的 8 位指数（不像传统 FP16 容易溢出变 NaN），把显存读写搬运流量直接砍半，同时吃满 Tensor Core 极限吞吐。
+
+2. `torch.compile(model)` 为什么能提速（解决"来回跑腿读写显存"）：
+   - 默认 Eager 模式下，一个 `GELU` 要分好几步算，每次算完都要写回慢速显存、再由 Python 调度读出来。
+   - `torch.compile` 做算子融合（Kernel Fusion），把零散步骤打包成唯一一个 GPU 指令，数据进高速缓存（SRAM）一口气算完再写回一次，彻底砍掉中间显存往返和 Python 调度开销。
