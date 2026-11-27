@@ -1209,3 +1209,18 @@ loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来�
 2. `torch.compile(model)` 为什么能提速（解决"来回跑腿读写显存"）：
    - 默认 Eager 模式下，一个 `GELU` 要分好几步算，每次算完都要写回慢速显存、再由 Python 调度读出来。
    - `torch.compile` 做算子融合（Kernel Fusion），把零散步骤打包成唯一一个 GPU 指令，数据进高速缓存（SRAM）一口气算完再写回一次，彻底砍掉中间显存往返和 Python 调度开销。
+
+
+──── 2026-11-27 ────
+（第十节 Reproduce GPT-2 看到约 2 小时 20 分钟：FlashAttention、Nice Number、梯度裁剪）
+
+1. FlashAttention（`F.scaled_dot_product_attention`）：
+   - 数学结果和手写版 100% 一致，但绝不在慢速显存（HBM）里真的生成那张巨大的 (T, T) 注意力表。
+   - 核心做法是分块（Tiling）：把 Q/K/V 切小块塞进核心旁的高速缓存（SRAM）里边算打分、边做局部 softmax、边乘 V，算完直接写回最终结果，彻底省掉中间显存来回搬运。
+
+2. 为什么 2 的幂次方 / 64 的倍数是 "Nice Number"：
+   - GPU Tensor Core 按固定尺寸砖块做矩阵乘。`50257` 这种奇数会留下边角料拖慢流水线；补齐成 `50304`（64 的倍数）后，矩阵明明变大了，算得反而更快。
+
+3. 本机显存账与 `clip_grad_norm_`：
+   - `B=16, T=1024` 全 FP32 跑 124M 模型光最后一层 logits 就占 3.3GB，总显存超 20GB，16GB 4080 会 OOM；改小 B（如 B=4）+ `bfloat16` 即可跑通。
+   - `torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)`：梯度限速器，算出全模型梯度总长度（L2 范数），超过 1.0 就保持方向不变等比例缩回 1.0，防止坏批次引发梯度爆炸。
