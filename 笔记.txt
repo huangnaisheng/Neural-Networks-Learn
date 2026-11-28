@@ -1224,3 +1224,18 @@ loss 从 2.47 / 2.49 掉到 2.38 / 2.40。中间踩了三个坑，都记下来�
 3. 本机显存账与 `clip_grad_norm_`：
    - `B=16, T=1024` 全 FP32 跑 124M 模型光最后一层 logits 就占 3.3GB，总显存超 20GB，16GB 4080 会 OOM；改小 B（如 B=4）+ `bfloat16` 即可跑通。
    - `torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)`：梯度限速器，算出全模型梯度总长度（L2 范数），超过 1.0 就保持方向不变等比例缩回 1.0，防止坏批次引发梯度爆炸。
+
+
+──── 2026-11-28 ────
+（第十节 Reproduce GPT-2 看到 3 小时 10 分钟：梯度累积 + DDP 多卡协同，全课还剩最后 50 分钟）
+
+1. ★ 梯度累积（时间换空间，小显存跑出 0.5M 大 Batch 的等价效果）：
+   - 自动计算步数：`grad_accum_steps = total_batch_size // (B * T)`，显存不够调小 `B` 即可自动增加累积步数，数学效果一模一样。
+   - `loss = loss / grad_accum_steps`：因为 `cross_entropy` 算的是小批均值，不除的话连续 `backward()` N 次会让攒出的梯度翻 N 倍。
+   - `loss_accum += loss.detach()`：必须 `.detach()` 把纯数字从计算图上剪下来记账，否则会把 N 轮的计算图全死死拽在显存里导致 OOM。
+   - `torch.cuda.synchronize()`：让 CPU 等 GPU 真正算完再掐表，否则测出的只是 CPU 派单耗时。
+
+2. ★ DDP 分布式训练（空间版梯度累积，看懂开源代码即可）：
+   - `DDP(model, device_ids=[ddp_local_rank])`：给模型套上"多卡对讲机外壳"（真身藏进 `model.module`），前向各算各的，反向时跨卡把梯度求平均（All-Reduce）。
+   - `model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)`：梯度累积的前几十轮关掉对讲机各自攒梯度，只在最后一轮打开同步，省掉大量跨卡通信耗时。
+   - `dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)` 让记账 loss 也取全集群平均；`if master_process:` 只让 0 号主卡打印日志免刷屏；最后 `destroy_process_group()` 解散群聊。
